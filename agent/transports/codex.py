@@ -249,7 +249,22 @@ class ResponsesApiTransport(ProviderTransport):
 
         request_overrides = params.get("request_overrides")
         if request_overrides:
-            kwargs.update(request_overrides)
+            for k, v in request_overrides.items():
+                if k == "headroom_profile" and v:
+                    existing_extra_headers = kwargs.get("extra_headers")
+                    merged_extra_headers: Dict[str, str] = {}
+                    if isinstance(existing_extra_headers, dict):
+                        merged_extra_headers.update(
+                            {
+                                str(key): str(value)
+                                for key, value in existing_extra_headers.items()
+                                if key and value is not None
+                            }
+                        )
+                    merged_extra_headers["X-Headroom-Profile"] = str(v)
+                    kwargs["extra_headers"] = merged_extra_headers
+                else:
+                    kwargs[k] = v
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing

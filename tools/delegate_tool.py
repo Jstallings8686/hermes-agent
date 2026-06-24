@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -983,6 +984,10 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    override_request_overrides: Optional[Dict[str, Any]] = None,
+    override_profile: Optional[str] = None,
+    override_base_url_explicit: bool = False,
+    override_api_key_explicit: bool = False,
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1124,8 +1129,16 @@ def _build_child_agent(
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    effective_api_key = override_api_key or parent_api_key
+    effective_base_url = (
+        override_base_url
+        if override_base_url_explicit
+        else (override_base_url or parent_agent.base_url)
+    )
+    effective_api_key = (
+        override_api_key
+        if override_api_key_explicit
+        else (override_api_key or parent_api_key)
+    )
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1218,6 +1231,9 @@ def _build_child_agent(
         max_iterations=max_iterations,
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,
+        request_overrides=override_request_overrides
+        if override_request_overrides is not None
+        else getattr(parent_agent, "request_overrides", None),
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
@@ -1248,6 +1264,7 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    child._delegate_profile = override_profile
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1299,6 +1316,9 @@ def _build_child_agent(
             child_subagent_id=subagent_id,
             child_role=effective_role,
             child_goal=goal,
+            child_model=getattr(child, "model", None),
+            child_provider=getattr(child, "provider", None),
+            child_profile=override_profile,
         )
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
@@ -1590,6 +1610,16 @@ def _run_single_child(
                     if isinstance(getattr(child, "model", None), str)
                     else None
                 ),
+                "provider": (
+                    getattr(child, "provider", None)
+                    if isinstance(getattr(child, "provider", None), str)
+                    else None
+                ),
+                "profile": (
+                    getattr(child, "_delegate_profile", None)
+                    if isinstance(getattr(child, "_delegate_profile", None), str)
+                    else None
+                ),
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -1827,6 +1857,8 @@ def _run_single_child(
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
+        _provider = getattr(child, "provider", None)
+        _profile = getattr(child, "_delegate_profile", None)
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -1835,6 +1867,8 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "provider": _provider if isinstance(_provider, str) else None,
+            "profile": _profile if isinstance(_profile, str) else None,
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2067,6 +2101,7 @@ def delegate_task(
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    profile: Optional[str] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
@@ -2079,7 +2114,7 @@ def delegate_task(
 
     Supports two modes:
       - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Batch:  provide tasks array [{goal, context, toolsets, role, profile}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2149,16 +2184,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2179,7 +2204,13 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "profile": profile,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2195,6 +2226,8 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        if profile and not task.get("profile"):
+            task["profile"] = profile
 
     overall_start = time.monotonic()
     results = []
@@ -2216,6 +2249,10 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            try:
+                creds = _resolve_delegation_credentials(cfg, parent_agent, t)
+            except ValueError as exc:
+                return tool_error(str(exc))
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
@@ -2233,6 +2270,10 @@ def delegate_task(
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
+                override_request_overrides=creds.get("request_overrides"),
+                override_profile=creds.get("profile"),
+                override_base_url_explicit=bool(creds.get("base_url_explicit")),
+                override_api_key_explicit=bool(creds.get("api_key_explicit")),
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get("command"),
@@ -2245,14 +2286,14 @@ def delegate_task(
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
-            children.append((i, t, child))
+            children.append((i, t, child, creds))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
-        _i, _t, child = children[0]
+        _i, _t, child, _creds = children[0]
 
         # ----- Async / background dispatch -----
         # When background=true, hand the already-built child to the async
@@ -2307,7 +2348,7 @@ def delegate_task(
                 context=_t.get("context"),
                 toolsets=_t.get("toolsets") or toolsets,
                 role=_normalize_role(_t.get("role") or top_role),
-                model=creds["model"],
+                model=_creds["model"],
                 session_key=_session_key,
                 runner=_async_runner,
                 interrupt_fn=_async_interrupt,
@@ -2346,7 +2387,7 @@ def delegate_task(
 
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
-            for i, t, child in children:
+            for i, t, child, _creds in children:
                 future = executor.submit(
                     _run_single_child,
                     task_index=i,
@@ -2363,7 +2404,7 @@ def delegate_task(
             # when the parent is interrupted.
             # Map task_index -> child agent, so fabricated entries for
             # still-pending futures can carry the correct _delegate_role.
-            _child_by_index = {i: child for (i, _, child) in children}
+            _child_by_index = {i: child for (i, _, child, _) in children}
 
             pending = set(futures.keys())
             while pending:
@@ -2648,7 +2689,130 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _clean_profile_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    name = str(value).strip()
+    return name or None
+
+
+def _expand_profile_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    def _replace(match: re.Match[str]) -> str:
+        return os.environ.get(match.group(1), match.group(0))
+
+    return re.sub(r"\$\{([^}]+)\}", _replace, value)
+
+
+def _resolve_delegation_profile(
+    args: dict,
+    delegation_cfg: dict,
+) -> tuple[Optional[str], Optional[dict]]:
+    requested = _clean_profile_name((args or {}).get("profile"))
+    if not requested:
+        requested = _clean_profile_name((delegation_cfg or {}).get("default_profile"))
+
+    if not requested:
+        return None, None
+
+    if not _PROFILE_NAME_RE.match(requested):
+        raise ValueError(
+            f"Invalid delegation profile '{requested}'. Profile names may only "
+            "contain letters, numbers, underscores, hyphens, and dots."
+        )
+
+    profiles = (delegation_cfg or {}).get("profiles") or {}
+    if not isinstance(profiles, dict):
+        raise ValueError("delegation.profiles must be a mapping")
+
+    profile_cfg = profiles.get(requested)
+    if not isinstance(profile_cfg, dict):
+        known = ", ".join(sorted(str(k) for k in profiles))
+        raise ValueError(
+            f"Unknown delegation profile '{requested}'. "
+            f"Known profiles: {known or '(none)'}"
+        )
+
+    return requested, dict(profile_cfg)
+
+
+def _build_credentials_from_profile(
+    parent_agent,
+    profile_name: str,
+    profile_cfg: dict,
+) -> dict:
+    provider = str(_expand_profile_value(profile_cfg.get("provider")) or "").strip()
+    model = str(_expand_profile_value(profile_cfg.get("model")) or "").strip()
+    base_url_raw = _expand_profile_value(profile_cfg.get("base_url"))
+    api_key_raw = _expand_profile_value(profile_cfg.get("api_key"))
+    api_mode = str(_expand_profile_value(profile_cfg.get("api_mode")) or "").strip().lower() or None
+    base_url = str(base_url_raw or "").strip() or None
+    api_key = str(api_key_raw or "").strip() or None
+
+    if not provider:
+        raise ValueError(f"Delegation profile '{profile_name}' must define provider.")
+    if not model:
+        raise ValueError(f"Delegation profile '{profile_name}' must define model.")
+
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested=provider,
+            explicit_api_key=api_key,
+            explicit_base_url=base_url,
+            target_model=model,
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve delegation profile '{profile_name}' "
+            f"(provider '{provider}'): {exc}"
+        ) from exc
+
+    resolved_provider = (
+        provider
+        if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+        else runtime.get("provider") or provider
+    )
+    request_overrides = dict(getattr(parent_agent, "request_overrides", {}) or {})
+    profile_overrides = profile_cfg.get("request_overrides") or {}
+    if profile_overrides and not isinstance(profile_overrides, dict):
+        raise ValueError(
+            f"Delegation profile '{profile_name}' request_overrides must be a mapping."
+        )
+    request_overrides.update(profile_overrides)
+    headroom_profile = _clean_profile_name(profile_cfg.get("headroom_profile"))
+    if headroom_profile:
+        request_overrides["headroom_profile"] = headroom_profile
+
+    return {
+        "model": model or runtime.get("model") or None,
+        "provider": resolved_provider,
+        "base_url": base_url if base_url is not None else runtime.get("base_url"),
+        "api_key": api_key if api_key is not None else (runtime.get("api_key") or None),
+        "api_mode": api_mode or runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "request_overrides": request_overrides or None,
+        "profile": profile_name,
+        "base_url_explicit": True,
+        "api_key_explicit": True,
+    }
+
+
+def _resolve_delegation_credentials(cfg: dict, parent_agent, args: Optional[dict] = None) -> dict:
+    profile_name, profile_cfg = _resolve_delegation_profile(args or {}, cfg or {})
+    if profile_cfg:
+        return _build_credentials_from_profile(parent_agent, profile_name, profile_cfg)
+    return _resolve_delegation_credentials_legacy(cfg, parent_agent)
+
+
+def _resolve_delegation_credentials_legacy(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -3009,6 +3173,14 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Optional delegation routing profile name from "
+                    "delegation.profiles. In batch mode this is the default "
+                    "for tasks that omit their own profile."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3023,6 +3195,14 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": (
+                                "Optional per-task delegation routing profile "
+                                "from delegation.profiles. Overrides the "
+                                "top-level profile."
+                            ),
                         },
                         "acp_command": {
                             "type": "string",
@@ -3113,6 +3293,7 @@ registry.register(
         context=args.get("context"),
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
+        profile=args.get("profile"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),

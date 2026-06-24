@@ -355,6 +355,11 @@ def _resolve_runtime_from_pool_entry(
         api_mode = "codex_responses"
     elif provider == "nous":
         api_mode = "chat_completions"
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        cfg_base_url = ""
+        if cfg_provider == "nous":
+            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+        base_url = cfg_base_url or base_url or "https://inference-api.nousresearch.com/v1"
     elif provider == "copilot":
         api_mode = _copilot_runtime_api_mode(model_cfg, getattr(entry, "runtime_api_key", ""))
         base_url = base_url or PROVIDER_REGISTRY["copilot"].inference_base_url
@@ -1293,8 +1298,10 @@ def _resolve_explicit_runtime(
 
     if provider == "nous":
         state = auth_mod.get_provider_auth_state("nous") or {}
+        cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = (
             explicit_base_url
+            or cfg_base_url
             or str(state.get("inference_base_url") or auth_mod.DEFAULT_NOUS_INFERENCE_URL).strip().rstrip("/")
         )
         # Only use the agent_key compatibility field for inference when it
@@ -1527,10 +1534,13 @@ def resolve_runtime_provider(
             creds = resolve_nous_runtime_credentials(
                 timeout_seconds=float(_getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
             )
+            # Honour config's model.base_url over the auth/default inference URL
+            cfg_base_url = str(model_cfg.get("base_url") or "").strip()
+            effective_base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
             return {
                 "provider": "nous",
                 "api_mode": "chat_completions",
-                "base_url": creds.get("base_url", "").rstrip("/"),
+                "base_url": effective_base_url,
                 "api_key": creds.get("api_key", ""),
                 "source": creds.get("source", "portal"),
                 "expires_at": creds.get("expires_at"),

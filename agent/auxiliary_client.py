@@ -1321,6 +1321,17 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
 
     api_key = str(creds.get("api_key") or "").strip()
     base_url = str(creds.get("base_url") or "").strip().rstrip("/")
+    # Honour config's model.base_url for auxiliary clients too
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _model_cfg = _cfg.get("model", {})
+        if isinstance(_model_cfg, dict):
+            _cfg_base = str(_model_cfg.get("base_url") or "").strip().rstrip("/")
+            if _cfg_base:
+                base_url = _cfg_base
+    except Exception:
+        pass
     if not api_key or not base_url:
         return None
     return api_key, base_url

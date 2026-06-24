@@ -451,7 +451,13 @@ class ChatCompletionsTransport(ProviderTransport):
         # Request overrides last (service_tier etc.)
         overrides = params.get("request_overrides")
         if overrides:
-            api_kwargs.update(overrides)
+            for k, v in overrides.items():
+                if k == "headroom_profile" and v:
+                    headers = dict(api_kwargs.get("extra_headers") or {})
+                    headers["X-Headroom-Profile"] = str(v)
+                    api_kwargs["extra_headers"] = headers
+                else:
+                    api_kwargs[k] = v
 
         return api_kwargs
 
@@ -568,6 +574,10 @@ class ChatCompletionsTransport(ProviderTransport):
             for k, v in overrides.items():
                 if k == "extra_body" and isinstance(v, dict):
                     extra_body.update(v)
+                elif k == "headroom_profile" and v:
+                    headers = dict(api_kwargs.get("extra_headers") or {})
+                    headers["X-Headroom-Profile"] = str(v)
+                    api_kwargs["extra_headers"] = headers
                 else:
                     api_kwargs[k] = v
 
